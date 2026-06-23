@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  router:
+    build: ./central-router
+    ports:
+      - "3000:3000"
+    volumes:
+      - router-data:/app/data
+    environment:
+      - PORT=3000
+      - ADMIN_SECRET=${ADMIN_SECRET:-change-this-in-production}
+      - RATE_LIMIT_RPM=60
+      - QUEUE_MAX_SIZE=50
+      - FIRST_TOKEN_TIMEOUT_MS=2000
+      - TOTAL_TIMEOUT_MS=30000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  router-data:
+    driver: local

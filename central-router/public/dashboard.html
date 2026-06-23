@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MeshGPU — Admin Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="dashboard">
+  <!-- ═══════════ HEADER ═══════════ -->
+  <header class="dash-header">
+    <div style="display:flex;align-items:center;gap:16px;">
+      <a href="/" class="nav-logo" style="font-size:1.2rem;">
+        <span class="logo-icon">⬡</span> MeshGPU
+      </a>
+      <span style="color:var(--text-muted);font-size:0.85rem;">Admin Dashboard</span>
+    </div>
+    <div class="dash-header-right">
+      <span class="status-dot"></span>
+      <span style="font-size:0.85rem;color:var(--text-secondary);" id="uptimeDisplay">—</span>
+      <a href="/" class="btn btn-sm btn-outline">← Back to Site</a>
+    </div>
+  </header>
+
+  <!-- ═══════════ STATS CARDS ═══════════ -->
+  <div class="dash-grid">
+    <div class="dash-card">
+      <div class="dash-card-title">Active Nodes</div>
+      <div class="dash-card-value" id="dNodes">0</div>
+      <div class="dash-card-sub" id="dNodesSub">0 idle · 0 busy</div>
+    </div>
+    <div class="dash-card">
+      <div class="dash-card-title">Requests Today</div>
+      <div class="dash-card-value" id="dToday">0</div>
+      <div class="dash-card-sub" id="dTotalSub">0 total</div>
+    </div>
+    <div class="dash-card">
+      <div class="dash-card-title">Avg Latency</div>
+      <div class="dash-card-value" id="dLatency">—</div>
+      <div class="dash-card-sub">ms per request</div>
+    </div>
+    <div class="dash-card">
+      <div class="dash-card-title">API Keys</div>
+      <div class="dash-card-value" id="dKeys">0</div>
+      <div class="dash-card-sub" id="dTokensSub">0 tokens generated</div>
+    </div>
+  </div>
+
+  <!-- ═══════════ MAIN PANELS ═══════════ -->
+  <div class="dash-main">
+    <!-- NODES TABLE -->
+    <div class="dash-panel">
+      <h3>🖥️ Provider Nodes</h3>
+      <div id="nodesTable">
+        <div class="empty-state">No nodes connected</div>
+      </div>
+    </div>
+
+    <!-- API KEYS -->
+    <div class="dash-panel">
+      <h3>🔑 API Keys</h3>
+      <div class="key-create-form">
+        <input type="text" id="newKeyName" placeholder="Key name (e.g. My App)">
+        <button class="btn btn-sm btn-primary" onclick="createKey()">Create</button>
+      </div>
+      <div id="newKeyDisplay" style="display:none;margin-bottom:16px;padding:12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius-sm);">
+        <span style="font-size:0.75rem;color:var(--warning);">⚠️ Save this key!</span>
+        <code id="newKeyValue" style="display:block;font-size:0.8rem;margin-top:4px;word-break:break-all;"></code>
+      </div>
+      <div id="keysTable">
+        <div class="empty-state">No API keys created</div>
+      </div>
+    </div>
+
+    <!-- RECENT REQUESTS -->
+    <div class="dash-panel dash-panel-full">
+      <h3>📡 Recent Requests</h3>
+      <div id="requestsTable">
+        <div class="empty-state">No requests yet</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ═══════════ DATA FETCHING ═══════════
+    async function fetchAndRender() {
+      try {
+        const [statsRes, nodesRes, reqsRes, keysRes] = await Promise.all([
+          fetch('/api/stats'),
+          fetch('/api/stats/nodes'),
+          fetch('/api/stats/requests'),
+          fetch('/api/keys'),
+        ]);
+
+        const stats = await statsRes.json();
+        const nodes = await nodesRes.json();
+        const reqs = await reqsRes.json();
+        const keys = await keysRes.json();
+
+        // ── Stats Cards ──
+        document.getElementById('dNodes').textContent = stats.network.nodes.total;
+        document.getElementById('dNodesSub').textContent =
+          `${stats.network.nodes.idle} idle · ${stats.network.nodes.busy} busy`;
+        document.getElementById('dToday').textContent = stats.stats.todayRequests.toLocaleString();
+        document.getElementById('dTotalSub').textContent =
+          `${stats.stats.totalRequests.toLocaleString()} total`;
+        document.getElementById('dLatency').textContent =
+          stats.stats.avgLatency ? stats.stats.avgLatency + 'ms' : '—';
+        document.getElementById('dKeys').textContent = stats.stats.activeKeys;
+        document.getElementById('dTokensSub').textContent =
+          `${stats.stats.totalTokens.toLocaleString()} tokens generated`;
+
+        // Uptime
+        const uptime = stats.network.uptime;
+        const h = Math.floor(uptime / 3600);
+        const m = Math.floor((uptime % 3600) / 60);
+        document.getElementById('uptimeDisplay').textContent =
+          `Uptime: ${h}h ${m}m`;
+
+        // ── Nodes Table ──
+        if (nodes.nodes.length > 0) {
+          const rows = nodes.nodes.map(n => {
+            const ago = timeSince(new Date(n.lastHeartbeat));
+            return `<tr>
+              <td><code style="font-size:0.8rem;">${n.nodeId}</code></td>
+              <td>${n.model}</td>
+              <td><span class="badge badge-${n.status}">${n.status}</span></td>
+              <td>${n.vramFreeMb} MB</td>
+              <td>${ago}</td>
+            </tr>`;
+          }).join('');
+
+          document.getElementById('nodesTable').innerHTML = `
+            <table class="dash-table">
+              <thead><tr>
+                <th>Node ID</th><th>Model</th><th>Status</th><th>VRAM Free</th><th>Last Heartbeat</th>
+              </tr></thead>
+              <tbody>${rows}</tbody>
+            </table>`;
+        } else {
+          document.getElementById('nodesTable').innerHTML =
+            '<div class="empty-state">No nodes connected. Start a provider node to see it here.</div>';
+        }
+
+        // ── API Keys Table ──
+        if (keys.keys && keys.keys.length > 0) {
+          const kRows = keys.keys.map(k => `<tr>
+            <td><code style="font-size:0.8rem;">${k.key_prefix}...</code></td>
+            <td>${k.name}</td>
+            <td>${k.total_requests.toLocaleString()}</td>
+            <td>${k.total_tokens.toLocaleString()}</td>
+            <td><span class="badge ${k.is_active ? 'badge-idle' : 'badge-error'}">${k.is_active ? 'active' : 'revoked'}</span></td>
+            <td>${k.is_active ? `<button class="btn btn-sm btn-outline" onclick="revokeKey(${k.id})" style="font-size:0.7rem;padding:2px 8px;">Revoke</button>` : '—'}</td>
+          </tr>`).join('');
+
+          document.getElementById('keysTable').innerHTML = `
+            <table class="dash-table">
+              <thead><tr>
+                <th>Key</th><th>Name</th><th>Requests</th><th>Tokens</th><th>Status</th><th></th>
+              </tr></thead>
+              <tbody>${kRows}</tbody>
+            </table>`;
+        }
+
+        // ── Recent Requests ──
+        if (reqs.requests && reqs.requests.length > 0) {
+          const rRows = reqs.requests.slice(0, 20).map(r => `<tr>
+            <td><code style="font-size:0.75rem;">${r.request_id.slice(0, 20)}</code></td>
+            <td>${r.model || '—'}</td>
+            <td>${r.node_id || '—'}</td>
+            <td>${r.tokens_completion}</td>
+            <td>${r.latency_ms}ms</td>
+            <td><span class="badge badge-${r.status === 'success' ? 'success' : 'error'}">${r.status}</span></td>
+            <td style="font-size:0.75rem;color:var(--text-muted);">${timeAgo(r.created_at)}</td>
+          </tr>`).join('');
+
+          document.getElementById('requestsTable').innerHTML = `
+            <table class="dash-table">
+              <thead><tr>
+                <th>Request ID</th><th>Model</th><th>Node</th><th>Tokens</th><th>Latency</th><th>Status</th><th>Time</th>
+              </tr></thead>
+              <tbody>${rRows}</tbody>
+            </table>`;
+        }
+      } catch (e) {
+        console.error('Dashboard fetch error:', e);
+      }
+    }
+
+    // ── Helpers ──
+    function timeSince(date) {
+      const s = Math.floor((new Date() - date) / 1000);
+      if (s < 5) return 'just now';
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.floor(s / 60) + 'm ago';
+      return Math.floor(s / 3600) + 'h ago';
+    }
+
+    function timeAgo(dateStr) {
+      return timeSince(new Date(dateStr + 'Z'));
+    }
+
+    // ── API Key Management ──
+    async function createKey() {
+      const name = document.getElementById('newKeyName').value.trim();
+      if (!name) return alert('Enter a key name');
+
+      const r = await fetch('/api/keys/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const d = await r.json();
+      if (d.success) {
+        document.getElementById('newKeyDisplay').style.display = 'block';
+        document.getElementById('newKeyValue').textContent = d.api_key;
+        document.getElementById('newKeyName').value = '';
+        fetchAndRender();
+      }
+    }
+
+    async function revokeKey(id) {
+      if (!confirm('Revoke this API key?')) return;
+      await fetch(`/api/keys/${id}`, { method: 'DELETE' });
+      fetchAndRender();
+    }
+
+    // ── Auto-refresh ──
+    fetchAndRender();
+    setInterval(fetchAndRender, 3000);
+  </script>
+</body>
+</html>

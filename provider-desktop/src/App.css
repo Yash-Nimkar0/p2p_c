@@ -1,0 +1,36 @@
+* { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+body { margin: 0; padding: 0; background: #0f172a; color: #f1f5f9; }
+
+.container { padding: 20px; max-width: 800px; margin: 0 auto; }
+.header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-bottom: 20px; }
+.header h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+
+.status-badge { padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; }
+.status-badge.stopped { background: #334155; color: #cbd5e1; }
+.status-badge.starting { background: #ca8a04; color: #fef08a; }
+.status-badge.running { background: #15803d; color: #bbf7d0; }
+.status-badge.stopping { background: #b91c1c; color: #fecaca; }
+
+.controls { background: #1e293b; padding: 20px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+.toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+
+.start-btn { background: #22c55e; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 1rem; }
+.start-btn:hover { background: #16a34a; }
+.stop-btn { background: #ef4444; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 1rem; }
+.stop-btn:hover:not(:disabled) { background: #dc2626; }
+.stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+.panel { background: #1e293b; padding: 20px; border-radius: 8px; text-align: center; }
+.panel h2 { margin: 0 0 10px 0; font-size: 1rem; color: #94a3b8; font-weight: 500; }
+.stat-value { font-size: 2rem; font-weight: bold; color: #38bdf8; }
+
+.log-panel { background: #0b0f19; border: 1px solid #334155; border-radius: 8px; overflow: hidden; }
+.log-panel h2 { margin: 0; padding: 15px; background: #1e293b; font-size: 1rem; border-bottom: 1px solid #334155; }
+.logs { padding: 15px; height: 250px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; }
+.log-line { margin-bottom: 4px; padding-bottom: 4px; border-bottom: 1px solid #1e293b; }
+.log-line.info { color: #cbd5e1; }
+.log-line.error { color: #fca5a5; }
+.log-line.warn { color: #fde047; }
+.log-level { font-weight: bold; margin-right: 8px; color: #94a3b8; }
+.dim { color: #64748b; font-style: italic; }
