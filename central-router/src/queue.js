@@ -32,9 +32,19 @@ const queue = [];
  * @param {string} model
  * @returns {Promise<{node: object|null, error: string|null, queued: boolean}>}
  */
-function acquireOrQueue(model) {
+async function acquireOrQueue(model, forceNodeId = null) {
+  // If explicitly challenged by the Verifier Sink Client
+  if (forceNodeId) {
+    const node = await registry.getNode(forceNodeId);
+    if (!node || node.status !== "idle") {
+      return { node: null, error: "Node busy or unavailable for challenge", queued: false };
+    }
+    await registry.markBusy(forceNodeId);
+    return { node, error: null, queued: false };
+  }
+
   // Try to acquire using load balancer logic
-  const { node, error, switch_needed } = loadBalancer.acquireNode(model);
+  const { node, error, switch_needed } = await loadBalancer.acquireNode(model);
 
   if (node && !switch_needed) {
     return Promise.resolve({ node, error: null, queued: false });
@@ -42,11 +52,11 @@ function acquireOrQueue(model) {
 
   if (switch_needed) {
     // Send the command to the repurposed node to switch models
-    wsHandler.sendSwitchModelCommand(node.nodeId, model);
+    await wsHandler.sendSwitchModelCommand(node.nodeId, model);
     // Even though we found a node, we must queue the request until the node finishes loading
   }
 
-  const counts = registry.getNodeCounts();
+  const counts = await registry.getNodeCounts();
 
   // No nodes at all — don't queue, fail fast
   if (counts.total === 0) {
@@ -114,7 +124,7 @@ function acquireOrQueue(model) {
  *
  * @param {string} model — The model the node has loaded
  */
-function tryDequeue(model) {
+async function tryDequeue(model) {
   if (queue.length === 0) return;
 
   // Find next matching queued request
@@ -122,12 +132,12 @@ function tryDequeue(model) {
   if (idx === -1) return;
 
   // Get an idle node
-  const node = registry.getIdleNode(model);
+  const node = await registry.getIdleNode(model);
   if (!node) return;
 
   // Dequeue and serve
   const entry = queue.splice(idx, 1)[0];
-  registry.markBusy(node.nodeId);
+  await registry.markBusy(node.nodeId);
 
   const waited = Date.now() - entry.enqueuedAt;
   log.info(`Dequeued request, waited ${waited}ms`, {

@@ -31,10 +31,10 @@ const router = express.Router();
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
 
 /** Timeout for receiving the first token (ms) */
-const FIRST_TOKEN_TIMEOUT = parseInt(process.env.FIRST_TOKEN_TIMEOUT_MS || "2000", 10);
+const FIRST_TOKEN_TIMEOUT = parseInt(process.env.FIRST_TOKEN_TIMEOUT_MS || "30000", 10);
 
 /** Total request timeout (ms) */
-const TOTAL_TIMEOUT = parseInt(process.env.TOTAL_TIMEOUT_MS || "30000", 10);
+const TOTAL_TIMEOUT = parseInt(process.env.TOTAL_TIMEOUT_MS || "600000", 10);
 
 // ──────────────────────────────────────────────
 // Supported models (hardcoded for MVP)
@@ -114,6 +114,7 @@ router.post("/v1/chat/completions", async (req, res) => {
  * open throughout — the developer sees a seamless response.
  */
 async function handleStreamingWithFailover(req, res, requestId, model, messages, startTime) {
+  const forceNodeId = req.body._internal_challenge_node || null;
   let attempt = 0;
   let headersSent = false;
   let totalTokens = 0;
@@ -131,9 +132,24 @@ async function handleStreamingWithFailover(req, res, requestId, model, messages,
       return;
     }
 
-    // ── Acquire a node (or queue if all busy) ──
-    const { node, error, queued } = await acquireOrQueue(model);
-    if (queued) log.info(`[${requestId}] Request was queued, now dequeued`);
+    let node = null;
+    let error = null;
+    
+    if (attempt === 0 && req.headers["x-allocated-node"]) {
+      // Nginx already allocated and marked this node busy
+      const allocatedId = req.headers["x-allocated-node"];
+      const registry = require("./registry");
+      node = await registry.getNode(allocatedId);
+      if (!node) {
+        error = "Allocated node disconnected before request arrived";
+      }
+    } else {
+      // ── Acquire a node (or queue if all busy) ──
+      const result = await acquireOrQueue(model, forceNodeId);
+      node = result.node;
+      error = result.error;
+      if (result.queued) log.info(`[${requestId}] Request was queued, now dequeued`);
+    }
 
     if (!node) {
       if (attempt === 0 && !headersSent) {
@@ -170,20 +186,18 @@ async function handleStreamingWithFailover(req, res, requestId, model, messages,
     });
 
     // ── Send inference request ──
-    const sent = wsHandler.sendInferenceRequest(currentNodeId, requestId, messages);
+    const sent = await wsHandler.sendInferenceRequest(currentNodeId, requestId, messages);
 
     if (!sent) {
       log.error(`[${requestId}] Failed to send to node [${currentNodeId}], trying next...`);
-      loadBalancer.releaseNode(currentNodeId);
+      await loadBalancer.releaseNode(currentNodeId);
       attempt++;
       continue;
     }
 
     // ── Wait for inference result ──
-    const result = await waitForInference(requestId, currentNodeId);
-
-    if (result.status === "success") {
-      // ── Stream all chunks to client ──
+    const result = await waitForInference(requestId, currentNodeId, (chunk) => {
+      // ── Stream chunks to client in real-time ──
       if (!headersSent) {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -192,16 +206,18 @@ async function handleStreamingWithFailover(req, res, requestId, model, messages,
           "X-Request-Id": requestId,
           "X-Node-Id": currentNodeId,
         });
-        res.flushHeaders();
+        if (typeof res.flushHeaders === "function") res.flushHeaders();
         headersSent = true;
       }
 
-      for (const chunk of result.chunks) {
-        if (clientDisconnected) break;
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        totalTokens++;
-      }
+      if (clientDisconnected) return;
+      
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      if (typeof res.flush === "function") res.flush();
+      totalTokens++;
+    });
 
+    if (result.status === "success") {
       if (!clientDisconnected) {
         res.write("data: [DONE]\n\n");
         res.end();
@@ -216,8 +232,8 @@ async function handleStreamingWithFailover(req, res, requestId, model, messages,
       });
 
       // ── Log usage + release node + dequeue ──
-      loadBalancer.releaseNode(currentNodeId);
-      tryDequeue(model);
+      await loadBalancer.releaseNode(currentNodeId);
+      await tryDequeue(model);
       if (req.apiKey) {
         try {
           db.logUsage({
@@ -300,6 +316,7 @@ async function handleStreamingWithFailover(req, res, requestId, model, messages,
  * Buffers all tokens, retries on failure, returns complete response.
  */
 async function handleNonStreamingWithFailover(req, res, requestId, model, messages, startTime) {
+  const forceNodeId = req.body._internal_challenge_node || null;
   let attempt = 0;
   let clientDisconnected = false;
 
@@ -311,8 +328,22 @@ async function handleNonStreamingWithFailover(req, res, requestId, model, messag
       return;
     }
 
-    const { node, error, queued } = await acquireOrQueue(model);
-    if (queued) log.info(`[${requestId}] Request was queued, now dequeued`);
+    let node = null;
+    let error = null;
+    
+    if (attempt === 0 && req.headers["x-allocated-node"]) {
+      const allocatedId = req.headers["x-allocated-node"];
+      const registry = require("./registry");
+      node = await registry.getNode(allocatedId);
+      if (!node) {
+        error = "Allocated node disconnected before request arrived";
+      }
+    } else {
+      const result = await acquireOrQueue(model, forceNodeId);
+      node = result.node;
+      error = result.error;
+      if (result.queued) log.info(`[${requestId}] Request was queued, now dequeued`);
+    }
 
     if (!node) {
       if (attempt === 0) {
@@ -378,8 +409,8 @@ async function handleNonStreamingWithFailover(req, res, requestId, model, messag
       });
 
       // ── Log usage + release node + dequeue ──
-      loadBalancer.releaseNode(nodeId);
-      tryDequeue(model);
+      await loadBalancer.releaseNode(nodeId);
+      await tryDequeue(model);
       if (req.apiKey) {
         try {
           db.logUsage({
@@ -440,9 +471,9 @@ async function handleNonStreamingWithFailover(req, res, requestId, model, messag
  *
  * @param {string} requestId
  * @param {string} nodeId
- * @returns {Promise<{status: string, reason?: string, chunks: object[]}>}
+ * @returns {Promise<{status: "success"|"failed", reason?: string, chunks?: object[]}>}
  */
-function waitForInference(requestId, nodeId) {
+function waitForInference(requestId, nodeId, onChunkCallback = null) {
   return new Promise((resolve) => {
     const chunks = [];
     let firstTokenReceived = false;
@@ -496,6 +527,9 @@ function waitForInference(requestId, nodeId) {
       }
 
       chunks.push(data.chunk);
+      if (onChunkCallback) {
+        onChunkCallback(data.chunk);
+      }
     }
 
     function onDone(data) {

@@ -68,7 +68,7 @@ function attachWebSocketServer(server) {
     log.info(`New WebSocket connection from ${remoteAddr}`);
 
     // ── Message Handler ──
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -87,7 +87,7 @@ function attachWebSocketServer(server) {
             return;
           }
 
-          registry.registerNode(nodeId, ws, {
+          await registry.registerNode(nodeId, ws, {
             model: msg.model,
             vram_free_mb: msg.vram_free_mb,
             port: msg.port,
@@ -107,7 +107,7 @@ function attachWebSocketServer(server) {
         case "heartbeat":
           if (!msg.node_id) return;
           nodeId = msg.node_id; // Update in case it wasn't set
-          registry.updateHeartbeat(msg.node_id, {
+          await registry.updateHeartbeat(msg.node_id, {
             status: msg.status,
             vram_free_mb: msg.vram_free_mb,
           });
@@ -131,7 +131,7 @@ function attachWebSocketServer(server) {
             if (completedNodeId) {
               activeRequests.delete(completedNodeId);
               requestToNode.delete(msg.request_id);
-              registry.markIdle(completedNodeId);
+              await registry.markIdle(completedNodeId);
             }
 
             events.emit("inference_done", {
@@ -149,7 +149,7 @@ function attachWebSocketServer(server) {
             if (failedNodeId) {
               activeRequests.delete(failedNodeId);
               requestToNode.delete(msg.request_id);
-              registry.markIdle(failedNodeId);
+              await registry.markIdle(failedNodeId);
             }
 
             events.emit("inference_error", {
@@ -173,7 +173,7 @@ function attachWebSocketServer(server) {
     });
 
     // ── Connection Close ──
-    ws.on("close", (code, reason) => {
+    ws.on("close", async (code, reason) => {
       const reasonStr = reason?.toString() || "unknown";
       log.warn(`WebSocket closed for node [${nodeId}]`, {
         code,
@@ -198,7 +198,7 @@ function attachWebSocketServer(server) {
           );
         }
 
-        registry.removeNode(nodeId, `ws_close(${code})`);
+        await registry.removeNode(nodeId, `ws_close(${code})`);
       }
     });
 
@@ -223,9 +223,10 @@ function attachWebSocketServer(server) {
  * @param {Array}  messages  — OpenAI-format messages array
  * @returns {boolean} — true if sent successfully, false otherwise
  */
-function sendInferenceRequest(nodeId, requestId, messages) {
-  const node = registry.getNode(nodeId);
-  if (!node || !node.ws || node.ws.readyState !== 1 /* OPEN */) {
+async function sendInferenceRequest(nodeId, requestId, messages) {
+  const ws = registry.getLocalWs(nodeId);
+
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
     log.error(`Cannot send request to node [${nodeId}] — not connected`);
     return false;
   }
@@ -237,13 +238,11 @@ function sendInferenceRequest(nodeId, requestId, messages) {
   });
 
   try {
-    node.ws.send(payload);
+    ws.send(payload);
 
     // Track the active request
     activeRequests.set(nodeId, requestId);
     requestToNode.set(requestId, nodeId);
-
-    registry.markBusy(nodeId);
 
     log.info(`Inference request [${requestId}] sent to node [${nodeId}]`);
     return true;
@@ -282,9 +281,9 @@ function clearRequestTracking(requestId) {
  * @param {string} nodeId
  * @param {string} newModel
  */
-function sendSwitchModelCommand(nodeId, newModel) {
-  const node = registry.getNode(nodeId);
-  if (!node || !node.ws || node.ws.readyState !== 1 /* OPEN */) {
+async function sendSwitchModelCommand(nodeId, newModel) {
+  const ws = registry.getLocalWs(nodeId);
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
     log.error(`Cannot send switch_model to node [${nodeId}] — not connected`);
     return false;
   }

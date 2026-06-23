@@ -1,292 +1,223 @@
 /**
- * Registry — In-memory registry of active Provider Nodes.
+ * Registry — Hybrid State Manager.
  *
- * Tracks every connected GPU provider: its WebSocket connection, loaded model,
- * busy/idle status, VRAM, and last heartbeat timestamp.
- *
- * The heartbeat monitor runs on a configurable interval and evicts nodes
- * that miss two consecutive heartbeats.
+ * Tracks local WebSocket connections in memory, but synchronizes all node metadata
+ * (model, status, vram, etc.) to Redis for global horizontal scaling.
  */
 
 const { createLogger } = require("./logger");
+const redis = require("./redis");
+
 const log = createLogger("registry");
 
-// ──────────────────────────────────────────────
-// Configuration
-// ──────────────────────────────────────────────
-
-/** Heartbeat check interval in ms (default: 5 seconds) */
 const HEARTBEAT_CHECK_INTERVAL = parseInt(process.env.HEARTBEAT_CHECK_MS || "5000", 10);
-
-/** Maximum time since last heartbeat before a node is evicted (default: 15s = 3 missed beats) */
 const HEARTBEAT_TIMEOUT = parseInt(process.env.HEARTBEAT_TIMEOUT_MS || "15000", 10);
 
-// ──────────────────────────────────────────────
-// Node Registry (Map<nodeId, NodeInfo>)
-// ──────────────────────────────────────────────
-
 /**
- * @typedef {Object} NodeInfo
- * @property {string}    nodeId        — Unique node identifier
- * @property {WebSocket} ws            — Live WebSocket connection
- * @property {string}    model         — Model loaded on this node (e.g. "llama-3-8b")
- * @property {"idle"|"busy"} status    — Current processing status
- * @property {number}    vramFreeMb    — Free VRAM in MB (self-reported)
- * @property {Date}      lastHeartbeat — Timestamp of last heartbeat
- * @property {Date}      registeredAt  — Timestamp of initial registration
- * @property {number}    port          — Port the node identified itself with
+ * Local memory map exclusively for holding WebSocket references.
+ * @type {Map<string, { ws: WebSocket, lastHeartbeat: Date }>}
  */
+const localConnections = new Map();
 
-/** @type {Map<string, NodeInfo>} */
-const nodes = new Map();
-
-/** Handle for the heartbeat monitor interval */
 let heartbeatMonitorHandle = null;
 
-// ──────────────────────────────────────────────
-// Public API
-// ──────────────────────────────────────────────
+// Use our own host IP or container ID for Nginx to route back to us
+// In Docker, hostname is the container ID.
+const ROUTER_IP = process.env.HOSTNAME || "localhost"; 
 
 /**
  * Register a new provider node.
- *
- * @param {string}    nodeId   — Unique node ID
- * @param {WebSocket} ws       — The node's WebSocket connection
- * @param {object}    metadata — { model, vramFreeMb, port }
  */
-function registerNode(nodeId, ws, metadata = {}) {
+async function registerNode(nodeId, ws, metadata = {}) {
+  // 1. Store WebSocket locally
+  localConnections.set(nodeId, { ws, lastHeartbeat: new Date() });
+
+  // 2. Sync Metadata to Redis
   const info = {
     nodeId,
-    ws,
     model: metadata.model || "unknown",
     status: "idle",
     vramFreeMb: metadata.vramFreeMb ?? metadata.vram_free_mb ?? 0,
-    lastHeartbeat: new Date(),
-    registeredAt: new Date(),
+    registeredAt: new Date().toISOString(),
     port: metadata.port || 0,
   };
 
-  nodes.set(nodeId, info);
+  await redis.setNodeState(nodeId, info);
+  await redis.setNodeRouting(nodeId, ROUTER_IP);
 
-  log.info(`Node registered: [${nodeId}]`, {
+  log.info(`Node registered globally: [${nodeId}]`, {
     model: info.model,
     vram: `${info.vramFreeMb}MB`,
-    total_nodes: nodes.size,
   });
 }
 
 /**
- * Remove a provider node from the registry.
- *
- * @param {string} nodeId
- * @param {string} [reason="unknown"] — Reason for removal (for logging)
+ * Remove a provider node.
  */
-function removeNode(nodeId, reason = "unknown") {
-  if (!nodes.has(nodeId)) return;
-
-  nodes.delete(nodeId);
-
-  log.warn(`Node removed: [${nodeId}]`, {
-    reason,
-    remaining_nodes: nodes.size,
-  });
+async function removeNode(nodeId, reason = "unknown") {
+  localConnections.delete(nodeId);
+  await redis.removeNodeState(nodeId);
+  log.warn(`Node removed globally: [${nodeId}]`, { reason });
 }
 
 /**
- * Get the first idle node that has a specific model loaded.
- *
- * @param {string} model — Model name to match (e.g. "llama-3-8b")
- * @returns {NodeInfo|null} — The idle node, or null if none available
+ * Mark a node as busy.
  */
-function getIdleNode(model) {
-  for (const [, node] of nodes) {
-    if (node.status === "idle" && node.model === model) {
-      return node;
-    }
-  }
-  return null;
-}
-
-/**
- * Get ANY idle node, regardless of the model loaded.
- * Useful for telling a node to switch to a new model.
- *
- * @returns {NodeInfo|null}
- */
-function getAnyIdleNode() {
-  for (const [, node] of nodes) {
-    if (node.status === "idle") {
-      return node;
-    }
-  }
-  return null;
-}
-
-/**
- * Get all idle nodes for a given model.
- *
- * @param {string} model
- * @returns {NodeInfo[]}
- */
-function getAllIdleNodes(model) {
-  const idle = [];
-  for (const [, node] of nodes) {
-    if (node.status === "idle" && node.model === model) {
-      idle.push(node);
-    }
-  }
-  return idle;
-}
-
-/**
- * Mark a node as busy (currently processing an inference request).
- *
- * @param {string} nodeId
- */
-function markBusy(nodeId) {
-  const node = nodes.get(nodeId);
+async function markBusy(nodeId) {
+  const nodes = await redis.getAllNodes();
+  const node = nodes.find(n => n.nodeId === nodeId);
   if (node) {
     node.status = "busy";
+    await redis.setNodeState(nodeId, node);
     log.debug(`Node [${nodeId}] → BUSY`);
   }
 }
 
 /**
- * Mark a node as idle (available for inference).
- *
- * @param {string} nodeId
+ * Mark a node as idle.
  */
-function markIdle(nodeId) {
-  const node = nodes.get(nodeId);
+async function markIdle(nodeId) {
+  const nodes = await redis.getAllNodes();
+  const node = nodes.find(n => n.nodeId === nodeId);
   if (node) {
     node.status = "idle";
+    await redis.setNodeState(nodeId, node);
     log.debug(`Node [${nodeId}] → IDLE`);
   }
 }
 
 /**
- * Update heartbeat timestamp and optional metadata for a node.
- *
- * @param {string} nodeId
- * @param {object} [metadata] — Optional fields to update (status, vramFreeMb)
+ * Update heartbeat timestamp and optional metadata.
  */
-function updateHeartbeat(nodeId, metadata = {}) {
-  const node = nodes.get(nodeId);
-  if (!node) {
+async function updateHeartbeat(nodeId, metadata = {}) {
+  const local = localConnections.get(nodeId);
+  if (!local) {
     log.warn(`Heartbeat from unknown node [${nodeId}]`);
     return;
   }
+  
+  // Update local memory timestamp for eviction
+  local.lastHeartbeat = new Date();
 
-  node.lastHeartbeat = new Date();
-
-  if (metadata.status) node.status = metadata.status;
-  if (metadata.model) node.model = metadata.model;
-  if (metadata.vram_free_mb !== undefined) node.vramFreeMb = metadata.vram_free_mb;
-  if (metadata.vramFreeMb !== undefined) node.vramFreeMb = metadata.vramFreeMb;
-
-  log.debug(`Heartbeat ♥ [${nodeId}]`, {
-    status: node.status,
-    vram: `${node.vramFreeMb}MB`,
-  });
-}
-
-/**
- * Get a node by its ID.
- *
- * @param {string} nodeId
- * @returns {NodeInfo|undefined}
- */
-function getNode(nodeId) {
-  return nodes.get(nodeId);
-}
-
-/**
- * Get a snapshot of all active nodes (for monitoring / health checks).
- *
- * @returns {object[]} — Array of node info objects (without WS reference)
- */
-function getActiveNodes() {
-  const result = [];
-  for (const [, node] of nodes) {
-    result.push({
-      nodeId: node.nodeId,
-      model: node.model,
-      status: node.status,
-      vramFreeMb: node.vramFreeMb,
-      lastHeartbeat: node.lastHeartbeat.toISOString(),
-      registeredAt: node.registeredAt.toISOString(),
-      port: node.port,
-    });
+  // If metadata changed, sync to Redis
+  if (metadata.status || metadata.model || metadata.vram_free_mb !== undefined) {
+    const nodes = await redis.getAllNodes();
+    const node = nodes.find(n => n.nodeId === nodeId);
+    if (node) {
+      if (metadata.status) node.status = metadata.status;
+      if (metadata.model) node.model = metadata.model;
+      if (metadata.vram_free_mb !== undefined) node.vramFreeMb = metadata.vram_free_mb;
+      await redis.setNodeState(nodeId, node);
+    }
   }
-  return result;
+
+  log.debug(`Heartbeat ♥ [${nodeId}]`);
 }
 
 /**
- * Get a count of nodes by status.
- *
- * @returns {{ total: number, idle: number, busy: number }}
+ * Get the first idle node globally that has a specific model loaded.
  */
-function getNodeCounts() {
+async function getIdleNode(model) {
+  const nodes = await redis.getAllNodes();
+  return nodes.find(n => n.status === "idle" && n.model === model) || null;
+}
+
+/**
+ * Get ANY idle node globally, regardless of the model loaded.
+ */
+async function getAnyIdleNode() {
+  const nodes = await redis.getAllNodes();
+  return nodes.find(n => n.status === "idle") || null;
+}
+
+/**
+ * Get all idle nodes globally for a given model.
+ */
+async function getAllIdleNodes(model) {
+  const nodes = await redis.getAllNodes();
+  return nodes.filter(n => n.status === "idle" && n.model === model);
+}
+
+/**
+ * Get a snapshot of all active nodes globally.
+ */
+async function getActiveNodes() {
+  return await redis.getAllNodes();
+}
+
+/**
+ * Get a specific node by ID.
+ */
+async function getNode(nodeId) {
+  const nodes = await redis.getAllNodes();
+  return nodes.find(n => n.nodeId === nodeId) || null;
+}
+
+/**
+ * Get the local WebSocket connection (if it exists on this instance).
+ */
+function getLocalWs(nodeId) {
+  const local = localConnections.get(nodeId);
+  return local ? local.ws : null;
+}
+
+/**
+ * Get global node counts.
+ */
+async function getNodeCounts() {
+  const nodes = await redis.getAllNodes();
   let idle = 0;
   let busy = 0;
-  for (const [, node] of nodes) {
+  for (const node of nodes) {
     if (node.status === "idle") idle++;
     else busy++;
   }
-  return { total: nodes.size, idle, busy };
+  return { total: nodes.length, idle, busy };
 }
 
 // ──────────────────────────────────────────────
-// Heartbeat Monitor
+// Heartbeat Monitor (Local Only)
 // ──────────────────────────────────────────────
 
 /**
- * Start the heartbeat monitor that evicts stale nodes.
- * Runs every HEARTBEAT_CHECK_INTERVAL ms and removes nodes
- * whose last heartbeat exceeds HEARTBEAT_TIMEOUT.
+ * The heartbeat monitor ONLY evicts local connections that drop.
+ * If a local connection drops, we remove it from global Redis.
  */
 function startHeartbeatMonitor() {
-  if (heartbeatMonitorHandle) return; // Already running
+  if (heartbeatMonitorHandle) return; 
 
-  log.info("Heartbeat monitor started", {
+  log.info("Heartbeat monitor started (Local Connections)", {
     check_interval: `${HEARTBEAT_CHECK_INTERVAL}ms`,
     timeout: `${HEARTBEAT_TIMEOUT}ms`,
   });
 
-  heartbeatMonitorHandle = setInterval(() => {
+  heartbeatMonitorHandle = setInterval(async () => {
     const now = Date.now();
     const staleIds = [];
 
-    for (const [nodeId, node] of nodes) {
-      const elapsed = now - node.lastHeartbeat.getTime();
+    for (const [nodeId, local] of localConnections) {
+      const elapsed = now - local.lastHeartbeat.getTime();
       if (elapsed > HEARTBEAT_TIMEOUT) {
         staleIds.push(nodeId);
       }
     }
 
     for (const nodeId of staleIds) {
-      const node = nodes.get(nodeId);
-      if (node && node.ws) {
+      const local = localConnections.get(nodeId);
+      if (local && local.ws) {
         try {
-          node.ws.close(1001, "Heartbeat timeout");
-        } catch (_) {
-          // Ignore close errors
-        }
+          local.ws.close(1001, "Heartbeat timeout");
+        } catch (_) {}
       }
-      removeNode(nodeId, "heartbeat_timeout");
+      await removeNode(nodeId, "heartbeat_timeout");
     }
 
     if (staleIds.length > 0) {
-      log.warn(`Evicted ${staleIds.length} stale node(s)`, {
-        evicted: staleIds,
-      });
+      log.warn(`Evicted ${staleIds.length} stale node(s)`);
     }
   }, HEARTBEAT_CHECK_INTERVAL);
 }
 
-/**
- * Stop the heartbeat monitor.
- */
 function stopHeartbeatMonitor() {
   if (heartbeatMonitorHandle) {
     clearInterval(heartbeatMonitorHandle);
@@ -294,10 +225,6 @@ function stopHeartbeatMonitor() {
     log.info("Heartbeat monitor stopped");
   }
 }
-
-// ──────────────────────────────────────────────
-// Exports
-// ──────────────────────────────────────────────
 
 module.exports = {
   registerNode,
@@ -313,4 +240,5 @@ module.exports = {
   getNodeCounts,
   startHeartbeatMonitor,
   stopHeartbeatMonitor,
+  getLocalWs,
 };

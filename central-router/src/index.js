@@ -24,6 +24,9 @@ const helmet = require("helmet");
 const cors = require("cors");
 const { createLogger } = require("./logger");
 const registry = require("./registry");
+const loadBalancer = require("./load-balancer");
+const verifier = require("./verifier");
+const db = require("./db");
 const wsHandler = require("./ws-handler");
 const gateway = require("./gateway");
 const apiKeys = require("./api-keys");
@@ -88,8 +91,8 @@ app.use(rateLimiterMiddleware);
 // ──────────────────────────────────────────────
 
 // Health check
-app.get("/health", (_req, res) => {
-  const counts = registry.getNodeCounts();
+app.get("/health", async (req, res) => {
+  const counts = await registry.getNodeCounts();
   res.json({
     status: "ok",
     uptime: Math.floor(process.uptime()),
@@ -98,10 +101,42 @@ app.get("/health", (_req, res) => {
 });
 
 // List active nodes (monitoring)
-app.get("/nodes", (_req, res) => {
+app.get("/dashboard/api/status", async (req, res) => {
   res.json({
-    nodes: registry.getActiveNodes(),
-    counts: registry.getNodeCounts(),
+    nodes: await registry.getActiveNodes(),
+    counts: await registry.getNodeCounts(),
+  });
+});
+
+// ──────────────────────────────────────────────
+// Internal Edge Routing (Nginx -> Node)
+// ──────────────────────────────────────────────
+
+// Nginx calls this to allocate an idle node for a model before proxying
+app.get("/internal/allocate", async (req, res) => {
+  const model = req.query.model || "llama-3-8b";
+  const { acquireOrQueue } = require("./queue");
+  
+  // This might take a few seconds if it hits the queue, but Nginx will wait.
+  const { node, error } = await acquireOrQueue(model);
+  
+  if (!node) {
+    return res.status(503).json({ error });
+  }
+
+  // Look up the specific router IP from Redis
+  const routerIp = await registry.getNodeRouting(node.nodeId);
+  
+  if (!routerIp) {
+    // Edge case: Node disconnected right after allocation
+    const loadBalancer = require("./load-balancer");
+    await loadBalancer.releaseNode(node.nodeId);
+    return res.status(503).json({ error: "Node disconnected during allocation" });
+  }
+
+  res.json({
+    nodeId: node.nodeId,
+    routerIp: routerIp
   });
 });
 
@@ -134,6 +169,7 @@ wsHandler.attachWebSocketServer(server);
 
 // Start heartbeat monitor
 registry.startHeartbeatMonitor();
+verifier.startVerificationDispatcher();
 
 // ──────────────────────────────────────────────
 // Start Listening
@@ -160,6 +196,7 @@ server.listen(PORT, () => {
 function shutdown(signal) {
   log.info(`Received ${signal}, shutting down...`);
   registry.stopHeartbeatMonitor();
+  verifier.stopVerificationDispatcher();
   server.close(() => {
     log.info("Server closed");
     process.exit(0);

@@ -14,8 +14,8 @@ const log = createLogger("api-stats");
 const router = express.Router();
 
 // GET /api/stats — Overall network statistics
-router.get("/api/stats", (req, res) => {
-  const nodeCounts = registry.getNodeCounts();
+router.get("/api/stats", async (req, res) => {
+  const nodeCounts = await registry.getNodeCounts();
   const queueStatus = getQueueStatus();
   const networkStats = db.getNetworkStats();
 
@@ -37,8 +37,8 @@ router.get("/api/stats", (req, res) => {
 });
 
 // GET /api/stats/nodes — Detailed node information
-router.get("/api/stats/nodes", (req, res) => {
-  const nodes = registry.getActiveNodes();
+router.get("/api/stats/nodes", async (req, res) => {
+  const nodes = await registry.getActiveNodes();
   res.json({ nodes, total: nodes.length });
 });
 

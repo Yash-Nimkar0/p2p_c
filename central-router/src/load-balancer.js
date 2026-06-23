@@ -19,11 +19,11 @@ const log = createLogger("load-balancer");
  * @param {string} model — Model name (e.g. "llama-3-8b")
  * @returns {{ node: object, error: null } | { node: null, error: string }}
  */
-function acquireNode(model) {
-  const node = registry.getIdleNode(model);
+async function acquireNode(model) {
+  const node = await registry.getIdleNode(model);
 
   if (!node) {
-    const counts = registry.getNodeCounts();
+    const counts = await registry.getNodeCounts();
 
     // Provide a descriptive error depending on the situation
     if (counts.total === 0) {
@@ -35,7 +35,7 @@ function acquireNode(model) {
     }
 
     // Nodes exist but all are busy
-    const idleForModel = registry.getAllIdleNodes(model);
+    const idleForModel = await registry.getAllIdleNodes(model);
     if (idleForModel.length === 0 && counts.busy > 0) {
       log.warn(`All nodes busy — cannot serve model "${model}"`, {
         total: counts.total,
@@ -48,10 +48,10 @@ function acquireNode(model) {
     }
 
     // Nodes exist but none have the requested model
-    const anyIdleNode = registry.getAnyIdleNode();
+    const anyIdleNode = await registry.getAnyIdleNode();
     if (anyIdleNode) {
       log.info(`Found idle node [${anyIdleNode.nodeId}] to repurpose for model "${model}"`);
-      registry.markBusy(anyIdleNode.nodeId);
+      await registry.markBusy(anyIdleNode.nodeId);
       return { node: anyIdleNode, error: null, switch_needed: true };
     }
 
@@ -65,7 +65,7 @@ function acquireNode(model) {
   }
 
   // Mark busy immediately to prevent double-assignment
-  registry.markBusy(node.nodeId);
+  await registry.markBusy(node.nodeId);
 
   log.info(`Acquired node [${node.nodeId}] for model "${model}"`, {
     vram: `${node.vramFreeMb}MB`,
@@ -79,8 +79,8 @@ function acquireNode(model) {
  *
  * @param {string} nodeId
  */
-function releaseNode(nodeId) {
-  registry.markIdle(nodeId);
+async function releaseNode(nodeId) {
+  await registry.markIdle(nodeId);
   log.info(`Released node [${nodeId}] → IDLE`);
 }
 

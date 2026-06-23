@@ -1,7 +1,3 @@
-/**
- * Redis — Horizontal Scaling & Cross-Router Pub/Sub.
- */
-
 const Redis = require("ioredis");
 const { createLogger } = require("./logger");
 
@@ -9,62 +5,90 @@ const log = createLogger("redis");
 
 const REDIS_URL = process.env.REDIS_URL || null;
 
-let pub = null;
-let sub = null;
+let redisClient = null;
 let isRedisEnabled = false;
 
 if (REDIS_URL) {
-  pub = new Redis(REDIS_URL);
-  sub = new Redis(REDIS_URL);
+  // Use a short timeout for local development testing
+  redisClient = new Redis(REDIS_URL, {
+    maxRetriesPerRequest: 3,
+    connectTimeout: 5000,
+  });
   isRedisEnabled = true;
 
-  pub.on("connect", () => log.info("Redis Publisher connected"));
-  sub.on("connect", () => log.info("Redis Subscriber connected"));
-  
-  pub.on("error", (err) => log.error(`Redis Pub Error: ${err.message}`));
-  sub.on("error", (err) => log.error(`Redis Sub Error: ${err.message}`));
+  redisClient.on("connect", () => log.info("Connected to Redis State Store"));
+  redisClient.on("error", (err) => log.error(`Redis Error: ${err.message}`));
 } else {
-  log.warn("REDIS_URL not set. Running in Single-Node / Memory mode.");
+  log.warn("REDIS_URL not set. State will not persist across restarts.");
+}
+
+// ──────────────────────────────────────────────
+// Node State Helpers
+// ──────────────────────────────────────────────
+
+/**
+ * Register or update a node's metadata in Redis.
+ * @param {string} nodeId
+ * @param {Object} metadata
+ */
+async function setNodeState(nodeId, metadata) {
+  if (!isRedisEnabled) return;
+  // Store node metadata as a JSON string in a Hash
+  await redisClient.hset("p2p:nodes:metadata", nodeId, JSON.stringify(metadata));
+  // Add to active set to track online nodes
+  await redisClient.sadd("p2p:nodes:active", nodeId);
 }
 
 /**
- * Publish an event to all router instances.
+ * Mark a node as offline/disconnected.
+ * @param {string} nodeId
  */
-function publishEvent(channel, eventType, payload) {
+async function removeNodeState(nodeId) {
   if (!isRedisEnabled) return;
-  const message = JSON.stringify({ type: eventType, data: payload, routerId: process.pid });
-  pub.publish(channel, message);
+  await redisClient.hdel("p2p:nodes:metadata", nodeId);
+  await redisClient.srem("p2p:nodes:active", nodeId);
+  await redisClient.hdel("p2p:nodes:routing", nodeId);
 }
 
 /**
- * Subscribe to a channel.
+ * Update the specific Router IP/ID that holds the WebSocket for a node.
+ * This is crucial for Nginx Layer 7 Load Balancing.
+ * @param {string} nodeId
+ * @param {string} routerIp
  */
-function subscribeToChannel(channel, handler) {
+async function setNodeRouting(nodeId, routerIp) {
   if (!isRedisEnabled) return;
-  sub.subscribe(channel, (err) => {
-    if (err) log.error(`Failed to subscribe to ${channel}: ${err.message}`);
-    else log.info(`Subscribed to Redis channel: ${channel}`);
-  });
+  await redisClient.hset("p2p:nodes:routing", nodeId, routerIp);
+}
 
-  sub.on("message", (ch, message) => {
-    if (ch === channel) {
-      try {
-        const parsed = JSON.parse(message);
-        // Ignore messages published by ourselves
-        if (parsed.routerId !== process.pid) {
-          handler(parsed.type, parsed.data);
-        }
-      } catch (err) {
-        log.error(`Failed to parse Redis message: ${err.message}`);
-      }
-    }
-  });
+/**
+ * Retrieve all currently active nodes and their metadata.
+ * @returns {Promise<Array<Object>>}
+ */
+async function getAllNodes() {
+  if (!isRedisEnabled) return [];
+  const activeIds = await redisClient.smembers("p2p:nodes:active");
+  if (activeIds.length === 0) return [];
+
+  const rawMetadata = await redisClient.hmget("p2p:nodes:metadata", ...activeIds);
+  return rawMetadata.filter(Boolean).map(raw => JSON.parse(raw));
+}
+
+/**
+ * Retrieve routing info for a specific node.
+ * @returns {Promise<string|null>} The router IP/ID holding the WS connection.
+ */
+async function getNodeRouting(nodeId) {
+  if (!isRedisEnabled) return null;
+  return await redisClient.hget("p2p:nodes:routing", nodeId);
 }
 
 module.exports = {
-  pub,
-  sub,
+  redisClient,
   isRedisEnabled,
-  publishEvent,
-  subscribeToChannel
+  setNodeState,
+  removeNodeState,
+  setNodeRouting,
+  getAllNodes,
+  getNodeRouting,
 };

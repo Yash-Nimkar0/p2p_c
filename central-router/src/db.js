@@ -69,7 +69,11 @@ db.exec(`
     node_id TEXT PRIMARY KEY,
     total_requests INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
-    balance_usd REAL DEFAULT 0.0,
+    pending_balance_usd REAL DEFAULT 0.0,
+    available_balance_usd REAL DEFAULT 0.0,
+    reputation_score INTEGER DEFAULT 100,
+    strikes INTEGER DEFAULT 0,
+    is_blacklisted INTEGER DEFAULT 0,
     first_seen TEXT DEFAULT (datetime('now')),
     last_seen TEXT DEFAULT (datetime('now'))
   );
@@ -78,6 +82,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at);
   CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(key_prefix);
 `);
+
+// Simple automatic migrations for existing DBs
+try {
+  db.exec(`
+    ALTER TABLE provider_stats ADD COLUMN pending_balance_usd REAL DEFAULT 0.0;
+    ALTER TABLE provider_stats ADD COLUMN available_balance_usd REAL DEFAULT 0.0;
+    ALTER TABLE provider_stats ADD COLUMN reputation_score INTEGER DEFAULT 100;
+    ALTER TABLE provider_stats ADD COLUMN strikes INTEGER DEFAULT 0;
+    ALTER TABLE provider_stats ADD COLUMN is_blacklisted INTEGER DEFAULT 0;
+  `);
+  log.info("Applied DB migration: Added provider verification columns");
+} catch (err) {
+  // Columns likely already exist, ignore.
+}
 
 log.info("Database schema ready");
 
@@ -282,6 +300,75 @@ function updateProviderStats(nodeId, tokensGenerated) {
 // Exports
 // ──────────────────────────────────────────────
 
+// ──────────────────────────────────────────────
+// Verification & Reputation (3-Strike System)
+// ──────────────────────────────────────────────
+
+/**
+ * Record a failed verification challenge for a node.
+ * If strikes >= 3, the node is permanently slashed.
+ *
+ * @param {string} nodeId
+ * @returns {object} { strikes, isSlashed }
+ */
+function addProviderStrike(nodeId) {
+  const stmt = db.prepare("SELECT strikes FROM provider_stats WHERE node_id = ?");
+  const row = stmt.get(nodeId);
+
+  if (!row) return { strikes: 0, isSlashed: false };
+
+  const newStrikes = row.strikes + 1;
+  const isSlashed = newStrikes >= 3;
+
+  if (isSlashed) {
+    // Slash the node: 0 out pending balance, set rep to 0, blacklist
+    db.prepare(`
+      UPDATE provider_stats 
+      SET strikes = ?, 
+          is_blacklisted = 1, 
+          reputation_score = 0, 
+          pending_balance_usd = 0.0 
+      WHERE node_id = ?
+    `).run(newStrikes, nodeId);
+    log.warn(`[SLASHED] Node [${nodeId}] has failed 3 verification challenges and is now blacklisted.`);
+  } else {
+    // Just add a strike and lower reputation
+    db.prepare(`
+      UPDATE provider_stats 
+      SET strikes = ?, 
+          reputation_score = MAX(0, reputation_score - 33) 
+      WHERE node_id = ?
+    `).run(newStrikes, nodeId);
+    log.warn(`[STRIKE] Node [${nodeId}] failed a verification challenge. Strike ${newStrikes}/3.`);
+  }
+
+  return { strikes: newStrikes, isSlashed };
+}
+
+/**
+ * Check if a node is blacklisted.
+ */
+function isNodeBlacklisted(nodeId) {
+  const stmt = db.prepare("SELECT is_blacklisted FROM provider_stats WHERE node_id = ?");
+  const row = stmt.get(nodeId);
+  return row ? row.is_blacklisted === 1 : false;
+}
+
+/**
+ * Pass a verification challenge, recovering reputation and unlocking some pending balance.
+ */
+function passVerificationChallenge(nodeId) {
+  // Move 10% of pending balance to available balance, recover some reputation
+  db.prepare(`
+    UPDATE provider_stats 
+    SET reputation_score = MIN(100, reputation_score + 10),
+        available_balance_usd = available_balance_usd + (pending_balance_usd * 0.10),
+        pending_balance_usd = pending_balance_usd - (pending_balance_usd * 0.10)
+    WHERE node_id = ? AND is_blacklisted = 0
+  `).run(nodeId);
+  log.info(`[VERIFIED] Node [${nodeId}] passed challenge. Reputation increased.`);
+}
+
 module.exports = {
   db,
   createApiKey,
@@ -292,4 +379,7 @@ module.exports = {
   getKeyUsageStats,
   getNetworkStats,
   updateProviderStats,
+  addProviderStrike,
+  isNodeBlacklisted,
+  passVerificationChallenge
 };
