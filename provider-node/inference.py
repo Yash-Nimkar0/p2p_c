@@ -46,23 +46,33 @@ async def stream_chat_completion(
     )
 
     try:
+        loop = asyncio.get_running_loop()
+
         # llama-cpp-python's create_chat_completion with stream=True
-        # returns a synchronous generator — run it in a thread executor
-        # to avoid blocking the async event loop.
-        stream = llm.create_chat_completion(
-            messages=messages,
-            stream=True,
+        # does prompt processing synchronously, so we must offload the creation
+        stream = await loop.run_in_executor(
+            None,
+            lambda: llm.create_chat_completion(
+                messages=messages,
+                stream=True,
+            )
         )
 
+        stream_iter = iter(stream)
         first_token_time = None
 
-        for chunk in stream:
+        while True:
+            # Yield control before blocking wait
+            await asyncio.sleep(0)
+            
+            # next() blocks while generating the token
+            chunk = await loop.run_in_executor(None, next, stream_iter, None)
+            if chunk is None:
+                break
+                
             # In mock mode, add a small delay between tokens
-            if config.MOCK_MODE:
-                await asyncio.sleep(config.MOCK_TOKEN_DELAY)
-            else:
-                # Yield control to the event loop between tokens
-                await asyncio.sleep(0)
+            if getattr(llm, "is_mock", False) or getattr(config, "MOCK_MODE", False):
+                await asyncio.sleep(getattr(config, "MOCK_TOKEN_DELAY", 0.05))
 
             choices = chunk.get("choices", [])
             if not choices:
