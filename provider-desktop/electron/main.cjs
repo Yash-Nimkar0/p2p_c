@@ -66,7 +66,7 @@ function startPythonNode(mock = true) {
 
   const scriptPath = path.join(__dirname, '..', '..', 'provider-node', 'main.py');
   
-  const args = ['-u', scriptPath, '--headless'];
+  const args = ['-u', scriptPath, '--json-logs'];
   if (mock) args.push('--mock');
 
   console.log(`Starting Python node: python3 ${args.join(' ')}`);
@@ -81,9 +81,14 @@ function startPythonNode(mock = true) {
   pythonProcess.stdout.on('data', (data) => {
     const lines = data.toString().split('\n').filter(l => l.trim() !== '');
     for (const text of lines) {
-      console.log(`[Python] ${text}`);
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('python-log', { level: 'INFO', text });
+        try {
+          const parsed = JSON.parse(text);
+          mainWindow.webContents.send('python-log', parsed);
+        } catch (e) {
+          // Fallback for non-JSON stdout (e.g. library prints)
+          mainWindow.webContents.send('python-log', { type: 'raw', text });
+        }
       }
     }
   });

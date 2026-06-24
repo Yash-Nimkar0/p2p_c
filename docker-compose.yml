@@ -36,6 +36,12 @@ services:
       - router
     restart: unless-stopped
 
+  trusted-verifier:
+    build: ./trusted-verifier
+    expose:
+      - "8000"
+    restart: unless-stopped
+
   redis:
     image: redis:alpine
     ports:

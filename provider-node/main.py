@@ -82,7 +82,20 @@ class NodeState:
     def log_event(self, msg, level="INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
         self.events.append((ts, level, msg))
-
+        
+        # If running in JSON mode, print directly to stdout for the Electron app to parse
+        import json
+        if getattr(self, 'json_logs', False):
+            print(json.dumps({
+                "type": "log",
+                "timestamp": ts,
+                "level": level,
+                "message": msg,
+                "node_id": self.node_id,
+                "requests_served": self.requests_served,
+                "tokens_generated": self.tokens_generated,
+                "earnings_usd": self.earnings
+            }), flush=True)
 
 state = NodeState()
 
@@ -285,10 +298,15 @@ Examples:
     parser.add_argument("--node-id", default=os.environ.get("NODE_ID", ""))
     parser.add_argument("--mock", action="store_true", default=os.environ.get("MOCK_MODE", "").lower() in ("1", "true"))
     parser.add_argument("--headless", action="store_true", default=os.environ.get("HEADLESS", "").lower() in ("1", "true"), help="Disable TUI")
+    parser.add_argument("--json-logs", action="store_true", help="Output logs in JSON format to stdout (implies --headless)")
     parser.add_argument("--n-gpu-layers", type=int, default=int(os.environ.get("N_GPU_LAYERS", "-1")))
     parser.add_argument("--n-ctx", type=int, default=int(os.environ.get("N_CTX", "4096")))
 
     args = parser.parse_args()
+    
+    if args.json_logs:
+        args.headless = True
+        state.json_logs = True
 
     # Build config
     config = Config()
